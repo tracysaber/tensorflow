@@ -92,12 +92,69 @@ struct ApplyMomentum<GPUDevice, T> {
     Eigen::Sizes<1> single;
     accum.device(d) = accum * momentum.reshape(single).broadcast(bcast) + grad;
     if (use_nesterov) {
-      var.device(d) -= grad * lr.reshape(single).broadcast(bcast) +
+      var.device(d) = grad * lr.reshape(single).broadcast(bcast) +
                        accum * momentum.reshape(single).broadcast(bcast) *
-                           lr.reshape(single).broadcast(bcast);
+                           lr.reshape(single).broadcast(bcast) +
+                      residual * lr.reshape(single).broadcast(bcast);
     } else {
-      var.device(d) -= lr.reshape(single).broadcast(bcast) * accum;
+      var.device(d) = lr.reshape(single).broadcast(bcast) * accum +
+                       residual * lr.reshape(single).broadcast(bcast);
     }
+    if (steps < WARMUP) {
+      return ctx->ps()->update(var.name(), var.data(), d.stream());
+    }
+    Tensor norm(DataTypeToEnum<T>::value, {});
+    norm.scalar<T>().device(d) = var.square().sum().sqrt();
+    Tensor threshold(DataTypeToEnum<T>::value, {});
+    threshold.scalar<T>()() = 6.0;
+    if (norm.scalar<T>()() > threshold.scalar<T>()()) {
+      var.device(d) = var * threshold.scalar<T>().reshape(single).broadcast(bcast) /
+          norm.scalar<T>().reshape(single).broadcast(bcast);
+    }
+    int size = var.size();
+    int capacity = size * 1.2 * (1.0 - 0.99);
+    Tensor sparse_buf;
+    OP_REQUIRES_OK(ctx, ctx->allocate_temp(
+        DataTypeToEnum<T>::value,
+        TensorShape({static_cast<int64>(capacity * sizeof(T))}), &sparse_buf));
+    T* buf = sparse_buf.template flat<T>().data();
+    Tensor sparse_indice;
+    OP_REQUIRES_OK(ctx, ctx->allocate_temp(
+        DataTypeToEnum<T>::value,
+        TensorShape({static_cast<int64>(capacity * sizeof(T))}), &sparse_indice));
+    T* indices = sparse_indice.template flat<T>().data();
+    T* data = var.data();
+    T* tmp = residual.data();
+    int sortSize = std::min(100000, size);
+    CudaLaunchConfig config2 = GetCudaLaunchConfig(sortSize, d);
+    sampling<T>
+        <<<config2.block_count, config2.thread_per_block, 0, d.stream()>>>
+        (data, tmp, sortSize, size / sortSize, size);
+    thrust::device_ptr<T> dev_data_ptr(tmp);
+    thrust::sort(dev_data_ptr, dev_data_ptr + sortSize);
+    float rate = 0.99;
+    T threshold;
+    int k_index = std::max(0, (int)(sortSize * rate) - 1);
+    cudaMemcpy(&threshold, tmp + k_index, sizeof(T), cudaMemcpyDeviceToHost);
+    CudaLaunchConfig config = GetCudaLaunchConfig(size, d);
+    gen_mask<T>
+        <<<config.block_count, config.thread_per_block, 0, d.stream()>>>
+        (data, tmp, accum.data(), threshold, size);
+    thrust::device_ptr<T> mask_ptr(tmp);
+    thrust::inclusive_scan(mask_ptr, mask_ptr + size, mask_ptr);
+    T sum;
+    cudaMemcpy(&sum, tmp + size - 1, sizeof(T), cudaMemcpyDeviceToHost);
+    unsigned long sparse_size = sum;
+    sparsify<T>
+        <<<config.block_count, config.thread_per_block, 0, d.stream()>>>
+        (data, tmp, buf, indices, size);
+    assign_residual<T>
+        <<<config.block_count, config.thread_per_block, 0, d.stream()>>>
+        (data, tmp, size);
+    cudaMemcpy(&data, buf, sizeof(T) * sparse_size, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(&data, indices, sizeof(T) * sparse_size, cudaMemcpyDeviceToDevice);
+    cudaStreamSynchronize(d.stream());
+    ctx->ps()->update(var.name(), data, sparse_size, d.stream());
   }
 };
 
