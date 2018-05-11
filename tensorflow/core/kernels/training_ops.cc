@@ -2351,9 +2351,13 @@ class ApplyMomentumOp : public OpKernel {
                                         momentum.shape().DebugString()));
 
     const Device& device = ctx->template eigen_device<Device>();
+    Tensor residual;
+    OP_REQUIRES_OK(ctx, GetInputTensor(ctx, 5, use_exclusive_lock_, &residual));
     functor::ApplyMomentum<Device, T>()(device, var.flat<T>(), accum.flat<T>(),
-                                        lr.scalar<T>(), grad.flat<T>(),
-                                        momentum.scalar<T>(), use_nesterov_);
+                                    lr.scalar<T>(), grad.flat<T>(),
+                                    momentum.scalar<T>(), residual.flat<T>(),
+                                    use_nesterov_,
+                                    ctx, steps);
     MaybeForwardRefInputToRefOutput(ctx, 0, 0);
   }
 
