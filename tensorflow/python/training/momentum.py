@@ -75,6 +75,8 @@ class MomentumOptimizer(optimizer.Optimizer):
   def _create_slots(self, var_list):
     for v in var_list:
       self._zeros_slot(v, "momentum", self._name)
+    for v in var_list:
+      self._zeros_slot(v, "residual", self._name)
 
   def _prepare(self):
     learning_rate = self._learning_rate
